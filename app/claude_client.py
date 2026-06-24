@@ -31,7 +31,7 @@ structured information and return ONLY a valid JSON object with exactly these fi
 {
   "title": "concise issue title",
   "summary": "one-paragraph description of the bug",
-  "severity": "low" | "medium" | "high" | "critical",
+  "severity": "low" | "medium" | "high" | "critical" | "unknown",
   "affected_component": "the system/feature/page affected",
   "reproduction_steps": ["step 1", "step 2", ...],
   "expected_behavior": "what should happen",
@@ -40,8 +40,8 @@ structured information and return ONLY a valid JSON object with exactly these fi
 
 Rules:
 - Output raw JSON only — no markdown fences, no explanation, no preamble.
-- If a field cannot be determined from the conversation, use an empty string or empty array.
-- severity must be exactly one of: low, medium, high, critical.
+- If a text field cannot be determined from the conversation, use an empty string; if a list field cannot be determined, use an empty array.
+- severity must be exactly one of: low, medium, high, critical, unknown — never empty. Use "unknown" if it cannot be determined from the conversation.
 """
 
 

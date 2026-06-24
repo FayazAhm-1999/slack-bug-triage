@@ -98,7 +98,7 @@ def format_issue_body(bug: BugReport, slack_thread_url: str | None) -> str:
 
 ## Severity
 
-{bug.severity.capitalize()}
+{bug.severity.capitalize() if bug.severity != "unknown" else "_Unknown — needs triage_"}
 
 ## Affected Component
 
@@ -123,4 +123,7 @@ def format_issue_body(bug: BugReport, slack_thread_url: str | None) -> str:
 
 
 def build_labels(severity: str) -> list[str]:
-    return ["bug", f"severity:{severity}"]
+    labels = ["bug", f"severity:{severity}"]
+    if severity == "unknown":
+        labels.append("needs-severity-triage")
+    return labels

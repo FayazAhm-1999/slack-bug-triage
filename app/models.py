@@ -7,7 +7,7 @@ from pydantic import BaseModel, field_validator
 class BugReport(BaseModel):
     title: str
     summary: str
-    severity: Literal["low", "medium", "high", "critical"]
+    severity: Literal["low", "medium", "high", "critical", "unknown"]
     affected_component: str
     reproduction_steps: list[str]
     expected_behavior: str
