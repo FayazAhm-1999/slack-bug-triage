@@ -3,6 +3,8 @@
 Uses a strict system prompt that instructs Claude to return raw JSON only.
 Retries once on parse failure before giving up — avoids infinite loops while
 tolerating the occasional malformed response.
+
+A single shared AsyncAnthropic client is reused across calls.
 """
 
 import json
@@ -16,9 +18,11 @@ from app.models import BugReport
 
 logger = logging.getLogger(__name__)
 
-# claude-sonnet-4-6 balances quality and speed well for structured extraction.
-# Swap to claude-haiku-4-5-20251001 for lower cost / higher throughput.
+# claude-haiku-4-5-20251001 balances quality and speed well for structured extraction.
+# Swap to claude-sonnet-4-6 for higher quality at greater cost.
 _MODEL = "claude-haiku-4-5-20251001"
+
+_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
 _SYSTEM_PROMPT = """\
 You are a bug report extraction assistant. Given a Slack conversation, extract
@@ -49,8 +53,6 @@ async def extract_bug_report(
 
     Returns None if Claude fails to produce valid JSON after one retry.
     """
-    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-
     replies_text = "\n".join(f"- {r}" for r in thread_replies) if thread_replies else "(no replies)"
     user_content = f"Original message:\n{original_message}\n\nThread replies:\n{replies_text}"
 
@@ -60,7 +62,7 @@ async def extract_bug_report(
             user_content += "\n\nIMPORTANT: Your previous response was not valid JSON. Respond with the raw JSON object only."
 
         try:
-            response = await client.messages.create(
+            response = await _client.messages.create(
                 model=_MODEL,
                 max_tokens=1024,
                 system=_SYSTEM_PROMPT,
@@ -70,7 +72,7 @@ async def extract_bug_report(
 
             # Strip accidental markdown fences if Claude ignores instructions
             if raw.startswith("```"):
-                raw = raw.split("```")[1]
+                raw = raw.split("```", 2)[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
                 raw = raw.strip()

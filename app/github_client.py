@@ -2,6 +2,9 @@
 
 All outbound GitHub calls go through this module.
 Requires a personal access token with repo scope.
+
+A single shared AsyncClient is reused across all calls for connection
+pooling and keep-alive.  Call close() during app shutdown.
 """
 
 import logging
@@ -13,6 +16,13 @@ from app.models import BugReport
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.github.com"
+
+_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+
+
+async def close() -> None:
+    """Close the shared HTTP client. Call during app shutdown."""
+    await _client.aclose()
 
 
 def _headers() -> dict[str, str]:
@@ -29,42 +39,51 @@ def _repo_url(path: str) -> str:
 
 async def get_open_issues(count: int = 50) -> list[dict]:
     """Fetch the most recent open issues for duplicate detection."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            _repo_url("/issues"),
-            headers=_headers(),
-            params={"state": "open", "per_page": count},
+    resp = await _client.get(
+        _repo_url("/issues"),
+        headers=_headers(),
+        params={"state": "open", "per_page": count},
+    )
+    if resp.status_code != 200:
+        logger.error(
+            "get_open_issues HTTP %s: %s",
+            resp.status_code,
+            resp.json().get("message", "<no message>"),
         )
-        if resp.status_code != 200:
-            logger.error("get_open_issues HTTP %s: %s", resp.status_code, resp.text)
-            return []
-        return resp.json()
+        return []
+    return resp.json()
 
 
 async def create_issue(title: str, body: str, labels: list[str]) -> dict:
     """Create a GitHub issue and return the response dict (includes html_url, number)."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            _repo_url("/issues"),
-            headers=_headers(),
-            json={"title": title, "body": body, "labels": labels},
+    resp = await _client.post(
+        _repo_url("/issues"),
+        headers=_headers(),
+        json={"title": title, "body": body, "labels": labels},
+    )
+    if resp.status_code not in (200, 201):
+        logger.error(
+            "create_issue HTTP %s: %s",
+            resp.status_code,
+            resp.json().get("message", "<no message>"),
         )
-        if resp.status_code not in (200, 201):
-            logger.error("create_issue HTTP %s: %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-        return resp.json()
+        resp.raise_for_status()
+    return resp.json()
 
 
 async def add_comment(issue_number: int, body: str) -> None:
     """Append a comment to an existing GitHub issue."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            _repo_url(f"/issues/{issue_number}/comments"),
-            headers=_headers(),
-            json={"body": body},
+    resp = await _client.post(
+        _repo_url(f"/issues/{issue_number}/comments"),
+        headers=_headers(),
+        json={"body": body},
+    )
+    if resp.status_code not in (200, 201):
+        logger.error(
+            "add_comment HTTP %s: %s",
+            resp.status_code,
+            resp.json().get("message", "<no message>"),
         )
-        if resp.status_code not in (200, 201):
-            logger.error("add_comment HTTP %s: %s", resp.status_code, resp.text)
 
 
 def format_issue_body(bug: BugReport, slack_thread_url: str | None) -> str:

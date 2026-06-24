@@ -7,8 +7,10 @@ Two Slack event paths:
 Key design decisions:
   - Respond 200 immediately, do all work in a background asyncio task.
     Slack retries if it doesn't receive 2xx within 3 seconds.
-  - Deduplicate Slack retries by checking X-Slack-Retry-Num header.
+  - Deduplicate Slack retries by checking X-Slack-Retry-Num header AND
+    an in-memory event-key set keyed on (channel, ts).
   - Verify HMAC-SHA256 signature on every request to prevent spoofing.
+  - Shared HTTP clients (slack_client, github_client) are closed on shutdown.
 """
 
 import asyncio
@@ -16,13 +18,14 @@ import hashlib
 import hmac
 import logging
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
 from app import bug_extractor, duplicate_detector, github_client, slack_client
-from app.config import settings
-from app.models import MessageEvent, ReactionEvent, SlackEventPayload
+from app.config import AUTHORIZED_USER_IDS, settings
+from app.models import MessageEvent, ReactionEvent, SlackEventPayload, SlackThreadContext
 from app.validator import score_bug_report
 
 logging.basicConfig(
@@ -31,7 +34,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Slack Bug Triage Assistant")
+
+# ---------------------------------------------------------------------------
+# In-memory event deduplication
+# ---------------------------------------------------------------------------
+
+class _ExpiringSet:
+    """Bounded TTL set for deduplicating Slack event deliveries.
+
+    Entries expire after `ttl_seconds`. The internal dict is compacted when it
+    grows beyond `_MAX_SIZE` to prevent unbounded memory growth.
+    """
+
+    _MAX_SIZE = 2000
+
+    def __init__(self, ttl_seconds: int = 600) -> None:
+        self._data: dict[str, float] = {}
+        self._ttl = ttl_seconds
+
+    def seen(self, key: str) -> bool:
+        """Return True if key was seen recently. Registers the key as seen."""
+        now = time.monotonic()
+        if len(self._data) >= self._MAX_SIZE:
+            self._data = {k: v for k, v in self._data.items() if now - v < self._ttl}
+        if key in self._data and now - self._data[key] < self._ttl:
+            return True
+        self._data[key] = now
+        return False
+
+
+_processed_events = _ExpiringSet()
+
+
+# ---------------------------------------------------------------------------
+# App lifespan — close shared HTTP clients on shutdown
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    await slack_client.close()
+    await github_client.close()
+
+
+app = FastAPI(title="Slack Bug Triage Assistant", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +145,14 @@ async def slack_events(request: Request) -> dict:
 
     if payload.type == "event_callback" and payload.event:
         event_type = payload.event.get("type")
+        channel = payload.event.get("channel", "")
+        ts = payload.event.get("ts", payload.event.get("item", {}).get("ts", ""))
+        event_key = f"{channel}:{ts}"
+
+        if _processed_events.seen(event_key):
+            logger.debug("Duplicate event suppressed: %s", event_key)
+            return {"ok": True}
+
         # Fire and forget — we must return 200 before Slack's 3-second timeout.
         asyncio.create_task(handle_event(event_type, payload.event))
 
@@ -130,56 +193,7 @@ async def handle_message_event(event: MessageEvent) -> None:
         return
 
     logger.info("Path 1: processing bug channel message ts=%s", event.ts)
-
-    messages = await slack_client.get_thread_messages(event.channel, event.ts)
-    permalink = await slack_client.get_message_permalink(event.channel, event.ts)
-
-    from app.models import SlackThreadContext
-    context = SlackThreadContext(
-        channel_id=event.channel,
-        message_ts=event.ts,
-        thread_ts=event.ts,
-        original_message=event.text,
-        thread_replies=[m.get("text", "") for m in messages[1:]],
-        permalink=permalink,
-    )
-
-    bug = await bug_extractor.extract_from_thread(context)
-    if bug is None:
-        logger.warning("Extraction failed for message %s — skipping", event.ts)
-        return
-
-    dup = await duplicate_detector.check_duplicate(bug)
-    if dup.is_duplicate:
-        comment = _build_duplicate_comment(bug, permalink)
-        await github_client.add_comment(dup.existing_issue_number, comment)
-        await slack_client.post_message(
-            event.channel,
-            event.ts,
-            f":link: This looks like a duplicate of {dup.existing_issue_url} "
-            f"(similarity: {dup.similarity_score:.0%}). I've added context to the existing issue.",
-        )
-        logger.info("Duplicate detected — commented on issue #%s", dup.existing_issue_number)
-        return
-
-    try:
-        body = github_client.format_issue_body(bug, permalink)
-        labels = github_client.build_labels(bug.severity)
-        issue = await github_client.create_issue(bug.title, body, labels)
-    except Exception:
-        logger.exception("GitHub issue creation failed for message %s", event.ts)
-        await slack_client.post_message(
-            event.channel, event.ts,
-            ":warning: Failed to create GitHub issue. Please file it manually.",
-        )
-        return
-
-    await slack_client.post_message(
-        event.channel,
-        event.ts,
-        f":white_check_mark: GitHub issue created: {issue['html_url']}",
-    )
-    logger.info("Created issue #%s for message %s", issue["number"], event.ts)
+    await _process_thread(event.channel, event.ts, run_quality_gate=False)
 
 
 # ---------------------------------------------------------------------------
@@ -196,26 +210,44 @@ async def handle_reaction_event(event: ReactionEvent) -> None:
         return
 
     # Authorization: only listed users may trigger issue creation
-    if event.user not in settings.authorized_user_ids:
+    if event.user not in AUTHORIZED_USER_IDS:
         logger.info("Unauthorized reaction from user %s — ignoring", event.user)
         return
 
-    channel_id = event.item.channel
-    message_ts = event.item.ts
+    logger.info("Path 2: processing reaction by %s on message %s", event.user, event.item.ts)
+    await _process_thread(event.item.channel, event.item.ts, run_quality_gate=True)
 
-    logger.info("Path 2: processing reaction by %s on message %s", event.user, message_ts)
+
+# ---------------------------------------------------------------------------
+# Shared pipeline: fetch thread → extract → (quality gate) → dup check → issue
+# ---------------------------------------------------------------------------
+
+async def _process_thread(
+    channel_id: str,
+    message_ts: str,
+    *,
+    run_quality_gate: bool,
+) -> None:
+    """Run the full triage pipeline for a single Slack message thread.
+
+    Args:
+        channel_id: The Slack channel the message lives in.
+        message_ts: The timestamp of the original message (also used as thread_ts).
+        run_quality_gate: If True, reject low-quality reports with user feedback
+                          (Path 2 only).
+    """
+    await slack_client.add_reaction(channel_id, message_ts, "eyes")
 
     messages = await slack_client.get_thread_messages(channel_id, message_ts)
     permalink = await slack_client.get_message_permalink(channel_id, message_ts)
 
-    original_text = messages[0].get("text", "") if messages else ""
+    original_message = messages[0].get("text", "") if messages else ""
 
-    from app.models import SlackThreadContext
     context = SlackThreadContext(
         channel_id=channel_id,
         message_ts=message_ts,
         thread_ts=message_ts,
-        original_message=original_text,
+        original_message=original_message,
         thread_replies=[m.get("text", "") for m in messages[1:]],
         permalink=permalink,
     )
@@ -225,14 +257,17 @@ async def handle_reaction_event(event: ReactionEvent) -> None:
         logger.warning("Extraction failed for message %s — skipping", message_ts)
         return
 
-    # Quality gate: Path 2 requires a minimum score before creating an issue
-    quality = score_bug_report(bug)
-    logger.info("Quality score for %s: %d/100 (passed=%s)", message_ts, quality.quality_score, quality.passed)
-
-    if not quality.passed:
-        feedback = _build_quality_feedback(quality)
-        await slack_client.post_message(channel_id, message_ts, feedback)
-        return
+    if run_quality_gate:
+        quality = score_bug_report(bug)
+        logger.info(
+            "Quality score for %s: %d/100 (passed=%s)",
+            message_ts, quality.quality_score, quality.passed,
+        )
+        if not quality.passed:
+            await slack_client.post_message(
+                channel_id, message_ts, _build_quality_feedback(quality)
+            )
+            return
 
     dup = await duplicate_detector.check_duplicate(bug)
     if dup.is_duplicate:
@@ -259,6 +294,7 @@ async def handle_reaction_event(event: ReactionEvent) -> None:
         )
         return
 
+    await slack_client.add_reaction(channel_id, message_ts, "white_check_mark")
     await slack_client.post_message(
         channel_id,
         message_ts,

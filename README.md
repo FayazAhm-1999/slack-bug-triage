@@ -92,6 +92,7 @@ Configure these in your Slack App settings under **OAuth & Permissions → Bot T
 | `channels:read` | Resolve channel IDs |
 | `chat:write` | Post confirmation and feedback messages |
 | `reactions:read` | Receive reaction_added events |
+| `reactions:write` | Add :eyes: and :white_check_mark: reactions to messages |
 
 Also enable **Event Subscriptions** and subscribe to:
 - `message.channels`
@@ -190,28 +191,39 @@ Processing every Slack message with Claude would be extremely expensive. The �
 
 Users who post in the dedicated bug channel have already made a conscious decision to report a bug. Blocking them with a quality gate would be frustrating and would undermine trust in the system. The tradeoff is that some low-quality issues may be created — but they can be triaged in GitHub.
 
-### TF-IDF over neural embeddings (duplicate detection)
+### Claude semantic comparison over TF-IDF (duplicate detection)
 
-TF-IDF cosine similarity was chosen over semantic embedding models because:
+TF-IDF was replaced because it is lexical — it counts shared terms. Paraphrases like *"the bot should react after parsing a ticket"* and *"the bot should acknowledge ticket creation with a reaction"* share almost no non-stopword terms after IDF weighting, so TF-IDF assigns them near-zero similarity despite describing the same problem. Claude understands semantic equivalence regardless of surface wording.
 
-- **No model download** — sentence-transformers pulls ~80MB + torch (~2GB). TF-IDF uses only scikit-learn.
-- **No extra API key** — OpenAI embeddings would require a second paid API.
-- **Technical vocabulary** — bug reports use specific terms ("NullPointerException", "422 on /api/checkout") that TF-IDF matches well via exact term overlap.
-- **Fast** — runs in milliseconds in-process over 50 issues.
+Each duplicate check sends a single Claude Haiku 4.5 call (~2,850 input tokens, ~50 output tokens):
 
-**Upgrade path**: replace `TfidfVectorizer` in `duplicate_detector.py` with `sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2").encode()`. The `DuplicateResult` interface is unchanged.
+| Volume | Cost per check | Daily | Monthly |
+|---|---|---|---|
+| 10 reports/day | ~$0.003 | ~$0.03 | ~$1 |
+| 100 reports/day | ~$0.003 | ~$0.30 | ~$9 |
+| 1,000 reports/day | ~$0.003 | ~$3.00 | ~$90 |
+| 10,000 reports/day | ~$0.003 | ~$30.00 | ~$900 |
 
-### Brute-force similarity (no vector database)
+The cost is **linear with incoming report volume** because every new report triggers one Claude call regardless of corpus size. This is fine at demo scale; it becomes the dominant cost at high volume.
 
-With only 50 issues, comparing every pair is trivially fast. A vector database (Pinecone, pgvector, Chroma) only pays off when the corpus grows to thousands of items and you need approximate nearest-neighbour search. Over-engineering for a prototype would obscure the actual logic.
+**Upgrade path for production**: pre-compute an embedding for each issue once (at creation time) and store it in a vector database (pgvector, Chroma). A duplicate check becomes one embedding call for the new bug plus a fast vector search — cost drops ~100× and no longer scales with report volume. The `DuplicateResult` interface in `duplicate_detector.py` is unchanged; only the similarity computation swaps out.
+
+Embedding options (no Anthropic embeddings API exists):
+- **sentence-transformers `all-MiniLM-L6-v2`** — free, local, ~80MB download (+ torch). Best for self-hosted.
+- **OpenAI `text-embedding-3-small`** — $0.02/MTok (~$0.000004 per bug report). Requires a second API key.
+- **Voyage AI `voyage-3-lite`** — $0.02/MTok, strong on technical text.
+
+### Brute-force comparison (no vector database)
+
+With only 50 issues, sending all titles and snippets to Claude in one prompt is trivially fast. A vector database only pays off when the corpus grows to thousands of items and you need approximate nearest-neighbour search at low latency. Adding one here would obscure the actual logic without measurable benefit at this scale.
 
 ### Scaling path
 
 When this needs to handle higher volume:
 
 1. **Replace `asyncio.create_task` with a message queue** (Redis + Celery, or AWS SQS + Lambda). The Slack endpoint enqueues the event payload; workers process it independently. This decouples ingestion from processing, enables retries, and provides backpressure.
-2. **Increase duplicate detection corpus** by caching recent issues in Redis with a TTL, rather than fetching 50 on every request.
-3. **Switch to semantic embeddings** stored in a vector database for more accurate cross-vocabulary duplicate detection.
+2. **Switch duplicate detection to pre-computed embeddings** stored in a vector database (pgvector, Chroma). See the upgrade path above — eliminates the linear cost growth.
+3. **Increase duplicate detection corpus** by caching recent issues in Redis with a TTL, rather than fetching 50 on every request.
 4. **Add a database** to track which Slack messages have been processed, preventing re-processing after restarts.
 
 ---
