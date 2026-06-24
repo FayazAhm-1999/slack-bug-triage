@@ -1,7 +1,7 @@
 """Shared Pydantic models — data contracts only, no business logic."""
 
 from typing import Literal
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class BugReport(BaseModel):
@@ -12,6 +12,11 @@ class BugReport(BaseModel):
     reproduction_steps: list[str]
     expected_behavior: str
     actual_behavior: str
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalise_severity(cls, v: object) -> object:
+        return v.lower() if isinstance(v, str) else v
 
 
 class QualityResult(BaseModel):
