@@ -184,8 +184,9 @@ async def handle_message_event(event: MessageEvent) -> None:
     if event.channel != settings.bug_channel_id:
         return
 
-    # Ignore bot messages, edits, and deletions
-    if event.subtype in ("bot_message", "message_changed", "message_deleted"):
+    # Only process plain user messages; any subtype means a system/bot/automated event
+    # (e.g. channel_join, bot_message, message_changed, message_deleted, etc.)
+    if event.subtype is not None:
         return
 
     # Ignore replies; only process new top-level messages
